@@ -24,20 +24,18 @@ ros2 launch foundation_stereo_ros stereo_depth.launch.py
 Override model paths if needed:
 ```bash
 ros2 launch foundation_stereo_ros stereo_depth.launch.py \
-  foundation_stereo_root:=/path/to/Fast-FoundationStereo \
-  model_dir:=/path/to/model_best_bp2_serialize.pth \
-  intrinsic_file:=/path/to/K.txt
+  params_file:=/path/to/stereo_depth.params.yaml
 ```
+
+Default parameters are stored in `config/stereo_depth.params.yaml`.
 
 Use TensorRT backend (same TrtRunner path as `run_demo_tensorrt.py`):
 ```bash
-ros2 launch foundation_stereo_ros stereo_depth.launch.py \
-  backend:=tensorrt \
-  device:=cuda \
-  trt_engine_dir:=/path/to/output \
-  trt_cfg_file:=/path/to/onnx.yaml
+# edit config/stereo_depth.params.yaml, then launch
+ros2 launch foundation_stereo_ros stereo_depth.launch.py
 ```
 
 Notes:
 - `backend:=pytorch` uses `model_dir` and supports `scale`, `valid_iters`, `max_disp`, `hiera`.
 - `backend:=tensorrt` uses `trt_engine_dir` with `feature_runner.engine` and `post_runner.engine`.
+- Input image size defaults to 400x488 (`input_height`, `input_width`) and intrinsics are adjusted once at node startup.

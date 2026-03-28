@@ -47,6 +47,8 @@ class FoundationStereoNode(Node):
         self.declare_parameter('intrinsic_file', '/home/kqu/capstone/foundation_stereo_ros/K.txt')
         self.declare_parameter('device', 'cuda')
         self.declare_parameter('scale', 1.0)
+        self.declare_parameter('input_height', 400)
+        self.declare_parameter('input_width', 488)
         self.declare_parameter('valid_iters', 8)
         self.declare_parameter('max_disp', 192)
         self.declare_parameter('hiera', 0)
@@ -67,6 +69,8 @@ class FoundationStereoNode(Node):
         self.intrinsic_file = os.path.expanduser(self.get_parameter('intrinsic_file').value)
         self.device = self.get_parameter('device').value
         self.scale = float(self.get_parameter('scale').value)
+        self.input_height = int(self.get_parameter('input_height').value)
+        self.input_width = int(self.get_parameter('input_width').value)
         self.valid_iters = int(self.get_parameter('valid_iters').value)
         self.max_disp = int(self.get_parameter('max_disp').value)
         self.hiera = int(self.get_parameter('hiera').value)
@@ -101,6 +105,7 @@ class FoundationStereoNode(Node):
             self.model = self._load_trt_runner()
 
         self.K_base, self.baseline = self._load_intrinsics(self.intrinsic_file)
+        self._init_projection_params()
 
         self.bridge = CvBridge()
         self.pointcloud_pub = self.create_publisher(PointCloud2, pointcloud_topic, 10)
@@ -122,6 +127,10 @@ class FoundationStereoNode(Node):
             self.get_logger().info(
                 f'TensorRT input trim size (HxW): {self.trt_input_size[0]}x{self.trt_input_size[1]}'
             )
+        self.get_logger().info(
+            f'Projection setup | input: {self.input_height}x{self.input_width}, model input: {self.model_input_size[0]}x{self.model_input_size[1]}, '
+            f'scale: ({self.scale_x:.4f}, {self.scale_y:.4f}), crop: ({self.crop_x}, {self.crop_y})'
+        )
 
     def _configure_logging(self) -> None:
         logging.basicConfig(
@@ -269,6 +278,50 @@ class FoundationStereoNode(Node):
         baseline = float(lines[1])
         return K, baseline
 
+    def _init_projection_params(self) -> None:
+        if self.input_height <= 0 or self.input_width <= 0:
+            raise RuntimeError('input_height and input_width must be positive')
+
+        in_h = self.input_height
+        in_w = self.input_width
+
+        if self.backend == 'pytorch':
+            out_h = int(round(in_h * self.scale))
+            out_w = int(round(in_w * self.scale))
+            if out_h <= 0 or out_w <= 0:
+                raise RuntimeError(
+                    f'Invalid scale {self.scale} for input size {in_h}x{in_w}; got output {out_h}x{out_w}'
+                )
+            self.scale_x = out_w / float(in_w)
+            self.scale_y = out_h / float(in_h)
+            self.crop_x = 0
+            self.crop_y = 0
+            self.model_input_size = (out_h, out_w)
+            self._pytorch_resize_dsize = (out_w, out_h)
+        else:
+            out_h, out_w = self.trt_input_size
+            if in_h < out_h or in_w < out_w:
+                raise RuntimeError(
+                    f'Input image {in_h}x{in_w} is smaller than TensorRT trim size {out_h}x{out_w}. '
+                    'Use smaller trt_input_height/trt_input_width or rebuild engines for this input size.'
+                )
+            self.scale_x = 1.0
+            self.scale_y = 1.0
+            self.crop_y = (in_h - out_h) // 2
+            self.crop_x = (in_w - out_w) // 2
+            self.model_input_size = (out_h, out_w)
+
+        self.K = self.K_base.copy()
+        self.K[0] *= self.scale_x
+        self.K[1] *= self.scale_y
+        self.K[0, 2] -= float(self.crop_x)
+        self.K[1, 2] -= float(self.crop_y)
+
+        self.fx = float(self.K[0, 0])
+        self.fy = float(self.K[1, 1])
+        self.cx = float(self.K[0, 2])
+        self.cy = float(self.K[1, 2])
+
     def _to_rgb_np(self, msg: Image) -> np.ndarray:
         if msg.encoding == 'mono8':
             mono = self.bridge.imgmsg_to_cv2(msg, desired_encoding='mono8')
@@ -313,39 +366,23 @@ class FoundationStereoNode(Node):
         disp = disp.data.cpu().numpy().reshape(H, W).clip(0, None)
         return disp
 
-    def _disparity_to_depth(self, disp: np.ndarray, sx: float, sy: float, crop_x: int, crop_y: int) -> np.ndarray:
+    def _disparity_to_depth(self, disp: np.ndarray) -> np.ndarray:
         if self.remove_invisible:
             yy, xx = np.meshgrid(np.arange(disp.shape[0]), np.arange(disp.shape[1]), indexing='ij')
             us_right = xx - disp
             invalid = us_right < 0
             disp[invalid] = np.inf
 
-        K = self.K_base.copy()
-        K[0] *= sx
-        K[1] *= sy
-        K[0, 2] -= float(crop_x)
-        K[1, 2] -= float(crop_y)
-
         with np.errstate(divide='ignore', invalid='ignore'):
-            depth = K[0, 0] * self.baseline / disp
+            depth = self.fx * self.baseline / disp
 
         depth = depth.astype(np.float32)
         depth[~np.isfinite(depth)] = 0.0
         depth[depth < 0.0] = 0.0
         return depth
 
-    def _depth_to_pointcloud_msg(self, depth: np.ndarray, header, sx: float, sy: float, crop_x: int, crop_y: int) -> PointCloud2:
+    def _depth_to_pointcloud_msg(self, depth: np.ndarray, header) -> PointCloud2:
         H, W = depth.shape
-        K = self.K_base.copy()
-        K[0] *= sx
-        K[1] *= sy
-        K[0, 2] -= float(crop_x)
-        K[1, 2] -= float(crop_y)
-
-        fx = float(K[0, 0])
-        fy = float(K[1, 1])
-        cx = float(K[0, 2])
-        cy = float(K[1, 2])
 
         yy, xx = np.indices((H, W), dtype=np.float32)
         z = depth.astype(np.float32)
@@ -354,8 +391,8 @@ class FoundationStereoNode(Node):
         if self.zfar > 0.0:
             valid &= z <= self.zfar
 
-        x = (xx - cx) * z / fx
-        y = (yy - cy) * z / fy
+        x = (xx - self.cx) * z / self.fx
+        y = (yy - self.cy) * z / self.fy
 
         points = np.stack([x[valid], y[valid], z[valid]], axis=1).astype(np.float32)
 
@@ -378,54 +415,52 @@ class FoundationStereoNode(Node):
         return msg
 
     def _infer_disparity_pytorch(self, left: np.ndarray, right: np.ndarray):
-        if self.scale != 1.0:
-            left = cv2.resize(left, fx=self.scale, fy=self.scale, dsize=None)
-            right = cv2.resize(right, dsize=(left.shape[1], left.shape[0]))
+        if (left.shape[0], left.shape[1]) != self.model_input_size:
+            left = cv2.resize(left, dsize=self._pytorch_resize_dsize)
+            right = cv2.resize(right, dsize=self._pytorch_resize_dsize)
 
         H, W = left.shape[:2]
         left_t, right_t, padder = self._prepare_tensors(left, right)
         disp = self._infer_disparity(left_t, right_t, H, W, padder)
-        return disp, self.scale, self.scale, 0, 0
-
-    def _center_trim_stereo(self, left: np.ndarray, right: np.ndarray, out_h: int, out_w: int):
-        in_h, in_w = left.shape[:2]
-        if right.shape[:2] != (in_h, in_w):
-            raise RuntimeError('Left/right image size mismatch before TensorRT trim')
-        if in_h < out_h or in_w < out_w:
-            raise RuntimeError(
-                f'Input image {in_h}x{in_w} is smaller than TensorRT trim size {out_h}x{out_w}. '
-                'Use smaller trt_input_height/trt_input_width or rebuild engines for this input size.'
-            )
-
-        y0 = (in_h - out_h) // 2
-        x0 = (in_w - out_w) // 2
-        y1 = y0 + out_h
-        x1 = x0 + out_w
-        return left[y0:y1, x0:x1], right[y0:y1, x0:x1], x0, y0
+        return disp
 
     def _infer_disparity_tensorrt(self, left: np.ndarray, right: np.ndarray):
-        out_h, out_w = self.trt_input_size
-        left, right, crop_x, crop_y = self._center_trim_stereo(left, right, out_h, out_w)
+        out_h, out_w = self.model_input_size
+        y0 = self.crop_y
+        x0 = self.crop_x
+        y1 = y0 + out_h
+        x1 = x0 + out_w
+        left = left[y0:y1, x0:x1]
+        right = right[y0:y1, x0:x1]
 
         left_t = torch.as_tensor(left).cuda().float()[None].permute(0, 3, 1, 2)
         right_t = torch.as_tensor(right).cuda().float()[None].permute(0, 3, 1, 2)
 
         disp = self.model.forward(left_t, right_t)
         disp = disp.data.cpu().numpy().reshape(out_h, out_w).clip(0, None)
-        return disp, 1.0, 1.0, crop_x, crop_y
+        return disp
 
     def stereo_callback(self, left_msg: Image, right_msg: Image) -> None:
         try:
             left = self._to_rgb_np(left_msg)
             right = self._to_rgb_np(right_msg)
 
-            if self.backend == 'pytorch':
-                disp, sx, sy, crop_x, crop_y = self._infer_disparity_pytorch(left, right)
-            else:
-                disp, sx, sy, crop_x, crop_y = self._infer_disparity_tensorrt(left, right)
+            if left.shape[:2] != (self.input_height, self.input_width):
+                raise RuntimeError(
+                    f'Unexpected left image size {left.shape[0]}x{left.shape[1]}; expected {self.input_height}x{self.input_width}'
+                )
+            if right.shape[:2] != (self.input_height, self.input_width):
+                raise RuntimeError(
+                    f'Unexpected right image size {right.shape[0]}x{right.shape[1]}; expected {self.input_height}x{self.input_width}'
+                )
 
-            depth = self._disparity_to_depth(disp, sx, sy, crop_x, crop_y)
-            pointcloud_msg = self._depth_to_pointcloud_msg(depth, left_msg.header, sx, sy, crop_x, crop_y)
+            if self.backend == 'pytorch':
+                disp = self._infer_disparity_pytorch(left, right)
+            else:
+                disp = self._infer_disparity_tensorrt(left, right)
+
+            depth = self._disparity_to_depth(disp)
+            pointcloud_msg = self._depth_to_pointcloud_msg(depth, left_msg.header)
             self.pointcloud_pub.publish(pointcloud_msg)
 
         except Exception as exc:
