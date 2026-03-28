@@ -406,6 +406,7 @@ class TrtRunner(nn.Module):
     self.post_context = self.post_engine.create_execution_context()
     if self.post_context is None:
       raise RuntimeError(f"Failed to create execution context for post engine: {post_runner_engine_path}")
+    self.trt_stream = torch.cuda.Stream(device=torch.cuda.current_device())
     self.max_disp = args.max_disp
     self.cv_group = args.get('cv_group', 8)
 
@@ -430,6 +431,7 @@ class TrtRunner(nn.Module):
 
   def run_trt(self, engine, context, inputs_by_name:dict):
     import tensorrt as trt
+    caller_stream = torch.cuda.current_stream()
     for name, tensor in list(inputs_by_name.items()):
       expected_dtype = self.trt_dtype_to_torch(engine.get_tensor_dtype(name))
       if tensor.dtype != expected_dtype: inputs_by_name[name] = tensor.to(expected_dtype)
@@ -443,9 +445,13 @@ class TrtRunner(nn.Module):
       outputs[name] = torch.empty(shp, device='cuda', dtype=dtype)
     for name, tensor in inputs_by_name.items(): context.set_tensor_address(name, int(tensor.data_ptr()))
     for name, tensor in outputs.items(): context.set_tensor_address(name, int(tensor.data_ptr()))
-    stream = torch.cuda.current_stream().cuda_stream
-    ok = context.execute_async_v3(stream)
-    assert ok
+
+    # Execute TensorRT on a dedicated non-default stream and synchronize with caller stream.
+    self.trt_stream.wait_stream(caller_stream)
+    ok = context.execute_async_v3(self.trt_stream.cuda_stream)
+    if not ok:
+      raise RuntimeError('TensorRT execute_async_v3 returned failure')
+    caller_stream.wait_stream(self.trt_stream)
     return outputs
 
   def forward(self, image1, image2):

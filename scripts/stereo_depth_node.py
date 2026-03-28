@@ -40,7 +40,7 @@ class FoundationStereoNode(Node):
         self.declare_parameter('pointcloud_topic', '/stereo/points')
         self.declare_parameter('backend', 'pytorch')
         self.declare_parameter('model_dir', 'model_best_bp2_serialize.pth')
-        self.declare_parameter('trt_engine_dir', '/home/kqu/Fast-FoundationStereo/output')
+        self.declare_parameter('trt_engine_dir', '/home/kqu/capstone/foundation_stereo_ros/onnx_23-36-37_iter8')
         self.declare_parameter('trt_cfg_file', '')
         self.declare_parameter('trt_input_height', 0)
         self.declare_parameter('trt_input_width', 0)
