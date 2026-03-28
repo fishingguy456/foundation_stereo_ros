@@ -16,6 +16,16 @@ install(PROGRAMS
   DESTINATION lib/${PROJECT_NAME}
 )
 
+install(FILES
+  Utils.py
+  DESTINATION lib/${PROJECT_NAME}
+)
+
+install(
+  DIRECTORY core
+  DESTINATION lib/${PROJECT_NAME}
+)
+
 install(
   DIRECTORY launch
   DESTINATION share/${PROJECT_NAME}
