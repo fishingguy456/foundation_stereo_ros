@@ -17,10 +17,15 @@ foundation_stereo_node:
     input_height: 400
     input_width: 488
 
-    valid_iters: 4  # pytorch uses this for inference; tensorrt uses it to select <model_name>_iter<valid_iters>
+    valid_iters: 8  # pytorch uses this for inference; tensorrt uses it to select <model_name>_iter<valid_iters>
     max_disp: 192
     hiera: 0
+    get_pc: 1
     remove_invisible: 1
+    denoise_cloud: 0
+    denoise_nb_points: 10
+    denoise_radius: 0.03
+    denoise_voxel_size: 0.01
     zfar: 5.0
     sync_slop: 0.03
     queue_size: 8

@@ -5,6 +5,7 @@ import sys
 import yaml
 import logging
 import glob
+import time
 from typing import Optional, Tuple
 
 import cv2
@@ -53,7 +54,12 @@ class FoundationStereoNode(Node):
         self.declare_parameter('valid_iters', 8)
         self.declare_parameter('max_disp', 192)
         self.declare_parameter('hiera', 0)
+        self.declare_parameter('get_pc', 1)
         self.declare_parameter('remove_invisible', 1)
+        self.declare_parameter('denoise_cloud', 0)
+        self.declare_parameter('denoise_nb_points', 30)
+        self.declare_parameter('denoise_radius', 0.03)
+        self.declare_parameter('denoise_voxel_size', 0.0)
         self.declare_parameter('zfar', 5.0)
         self.declare_parameter('sync_slop', 0.03)
         self.declare_parameter('queue_size', 8)
@@ -76,7 +82,12 @@ class FoundationStereoNode(Node):
         self.valid_iters = self.requested_valid_iters
         self.max_disp = int(self.get_parameter('max_disp').value)
         self.hiera = int(self.get_parameter('hiera').value)
+        self.get_pc = int(self.get_parameter('get_pc').value)
         self.remove_invisible = int(self.get_parameter('remove_invisible').value)
+        self.denoise_cloud = int(self.get_parameter('denoise_cloud').value)
+        self.denoise_nb_points = int(self.get_parameter('denoise_nb_points').value)
+        self.denoise_radius = float(self.get_parameter('denoise_radius').value)
+        self.denoise_voxel_size = float(self.get_parameter('denoise_voxel_size').value)
         self.zfar = float(self.get_parameter('zfar').value)
         sync_slop = float(self.get_parameter('sync_slop').value)
         queue_size = int(self.get_parameter('queue_size').value)
@@ -109,6 +120,19 @@ class FoundationStereoNode(Node):
 
         self.K_base, self.baseline = self._load_intrinsics(self.intrinsic_file)
         self._init_projection_params()
+        self._frame_count = 0
+
+        self.o3d = None
+        if self.denoise_cloud or self.denoise_voxel_size > 0.0:
+            try:
+                import open3d as o3d  # type: ignore
+
+                self.o3d = o3d
+            except Exception as exc:
+                raise RuntimeError(
+                    'Point cloud filtering is enabled, but open3d import failed. '
+                    'Install open3d or set denoise_cloud:=0 and denoise_voxel_size:=0.0.'
+                ) from exc
 
         self.bridge = CvBridge()
         self.pointcloud_pub = self.create_publisher(PointCloud2, pointcloud_topic, 10)
@@ -137,6 +161,12 @@ class FoundationStereoNode(Node):
         self.get_logger().info(
             f'Projection setup | input: {self.input_height}x{self.input_width}, model input: {self.model_input_size[0]}x{self.model_input_size[1]}, '
             f'scale: ({self.scale_x:.4f}, {self.scale_y:.4f}), crop: ({self.crop_x}, {self.crop_y})'
+        )
+        self.get_logger().info(
+            f'Point cloud options | get_pc: {self.get_pc}, remove_invisible: {self.remove_invisible}, '
+            f'denoise_cloud: {self.denoise_cloud}, '
+            f'denoise_nb_points: {self.denoise_nb_points}, '
+            f'denoise_radius: {self.denoise_radius}, denoise_voxel_size: {self.denoise_voxel_size}, zfar: {self.zfar}'
         )
 
     def _configure_logging(self) -> None:
@@ -385,6 +415,11 @@ class FoundationStereoNode(Node):
         self.cx = float(self.K[0, 2])
         self.cy = float(self.K[1, 2])
 
+        out_h, out_w = self.model_input_size
+        yy, xx = np.indices((out_h, out_w), dtype=np.float32)
+        self._ray_x_flat = ((xx - self.cx) / self.fx).reshape(-1)
+        self._ray_y_flat = ((yy - self.cy) / self.fy).reshape(-1)
+
     def _to_rgb_np(self, msg: Image) -> np.ndarray:
         if msg.encoding == 'mono8':
             mono = self.bridge.imgmsg_to_cv2(msg, desired_encoding='mono8')
@@ -444,20 +479,53 @@ class FoundationStereoNode(Node):
         depth[depth < 0.0] = 0.0
         return depth
 
-    def _depth_to_pointcloud_msg(self, depth: np.ndarray, header) -> PointCloud2:
-        H, W = depth.shape
-
-        yy, xx = np.indices((H, W), dtype=np.float32)
-        z = depth.astype(np.float32)
-
+    def _depth_to_points(self, depth: np.ndarray) -> np.ndarray:
+        z = depth.astype(np.float32, copy=False)
         valid = (z > 0.0) & np.isfinite(z)
         if self.zfar > 0.0:
             valid &= z <= self.zfar
 
-        x = (xx - self.cx) * z / self.fx
-        y = (yy - self.cy) * z / self.fy
+        valid_flat = valid.reshape(-1)
+        if not np.any(valid_flat):
+            return np.empty((0, 3), dtype=np.float32)
 
-        points = np.stack([x[valid], y[valid], z[valid]], axis=1).astype(np.float32)
+        z_valid = z.reshape(-1)[valid_flat]
+        points = np.empty((z_valid.shape[0], 3), dtype=np.float32)
+        points[:, 0] = self._ray_x_flat[valid_flat] * z_valid
+        points[:, 1] = self._ray_y_flat[valid_flat] * z_valid
+        points[:, 2] = z_valid
+        return points
+
+    def _denoise_points(self, points: np.ndarray) -> np.ndarray:
+        if points.shape[0] == 0:
+            return points
+
+        if not self.denoise_cloud and self.denoise_voxel_size <= 0.0:
+            return points
+
+        assert self.o3d is not None
+        pcd = self.o3d.geometry.PointCloud()
+        pcd.points = self.o3d.utility.Vector3dVector(points.astype(np.float64, copy=False))
+
+        if self.denoise_voxel_size > 0.0:
+            pcd = pcd.voxel_down_sample(voxel_size=self.denoise_voxel_size)
+            if len(pcd.points) == 0:
+                return np.empty((0, 3), dtype=np.float32)
+
+        if not self.denoise_cloud:
+            return np.asarray(pcd.points, dtype=np.float32)
+
+        _, inlier_ids = pcd.remove_radius_outlier(
+            nb_points=self.denoise_nb_points,
+            radius=self.denoise_radius,
+        )
+        if len(inlier_ids) == 0:
+            return np.empty((0, 3), dtype=np.float32)
+
+        pcd = pcd.select_by_index(inlier_ids)
+        return np.asarray(pcd.points, dtype=np.float32)
+
+    def _points_to_pointcloud_msg(self, points: np.ndarray, header) -> PointCloud2:
 
         fields = [
             PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
@@ -505,9 +573,14 @@ class FoundationStereoNode(Node):
 
     def stereo_callback(self, left_msg: Image, right_msg: Image) -> None:
         try:
+            cb_t0 = time.perf_counter()
+
+            t0 = time.perf_counter()
             left = self._to_rgb_np(left_msg)
             right = self._to_rgb_np(right_msg)
+            t_to_rgb_ms = (time.perf_counter() - t0) * 1000.0
 
+            t0 = time.perf_counter()
             if left.shape[:2] != (self.input_height, self.input_width):
                 raise RuntimeError(
                     f'Unexpected left image size {left.shape[0]}x{left.shape[1]}; expected {self.input_height}x{self.input_width}'
@@ -516,19 +589,54 @@ class FoundationStereoNode(Node):
                 raise RuntimeError(
                     f'Unexpected right image size {right.shape[0]}x{right.shape[1]}; expected {self.input_height}x{self.input_width}'
                 )
+            t_validate_ms = (time.perf_counter() - t0) * 1000.0
 
+            t0 = time.perf_counter()
             if self.backend == 'pytorch':
                 disp = self._infer_disparity_pytorch(left, right)
             else:
                 disp = self._infer_disparity_tensorrt(left, right)
+            t_infer_ms = (time.perf_counter() - t0) * 1000.0
 
+            t0 = time.perf_counter()
             depth = self._disparity_to_depth(disp)
+            t_disp_to_depth_ms = (time.perf_counter() - t0) * 1000.0
+
+            t0 = time.perf_counter()
             depth_msg = self.bridge.cv2_to_imgmsg(depth, encoding='32FC1')
             depth_msg.header = left_msg.header
             self.depth_pub.publish(depth_msg)
+            t_depth_pub_ms = (time.perf_counter() - t0) * 1000.0
 
-            pointcloud_msg = self._depth_to_pointcloud_msg(depth, left_msg.header)
-            self.pointcloud_pub.publish(pointcloud_msg)
+            t_points_ms = 0.0
+            t_denoise_ms = 0.0
+            t_pc_pub_ms = 0.0
+            num_points = 0
+
+            if self.get_pc:
+                t0 = time.perf_counter()
+                points = self._depth_to_points(depth)
+                t_points_ms = (time.perf_counter() - t0) * 1000.0
+
+                if self.denoise_cloud or self.denoise_voxel_size > 0.0:
+                    t0 = time.perf_counter()
+                    points = self._denoise_points(points)
+                    t_denoise_ms = (time.perf_counter() - t0) * 1000.0
+
+                num_points = int(points.shape[0])
+                t0 = time.perf_counter()
+                pointcloud_msg = self._points_to_pointcloud_msg(points, left_msg.header)
+                self.pointcloud_pub.publish(pointcloud_msg)
+                t_pc_pub_ms = (time.perf_counter() - t0) * 1000.0
+
+            cb_total_ms = (time.perf_counter() - cb_t0) * 1000.0
+            self._frame_count += 1
+            self.get_logger().info(
+                f'Timing frame={self._frame_count} | rgb={t_to_rgb_ms:.2f} ms, validate={t_validate_ms:.2f} ms, '
+                f'infer={t_infer_ms:.2f} ms, disp_to_depth={t_disp_to_depth_ms:.2f} ms, depth_pub={t_depth_pub_ms:.2f} ms, '
+                f'pc_points={t_points_ms:.2f} ms, pc_denoise={t_denoise_ms:.2f} ms, pc_pub={t_pc_pub_ms:.2f} ms, '
+                f'pc_count={num_points}, total={cb_total_ms:.2f} ms'
+            )
 
         except Exception as exc:
             self.get_logger().error(f'stereo callback failed: {exc}')
