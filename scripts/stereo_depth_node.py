@@ -4,6 +4,7 @@ import os
 import sys
 import yaml
 import logging
+import glob
 from typing import Optional, Tuple
 
 import cv2
@@ -38,10 +39,10 @@ class FoundationStereoNode(Node):
         self.declare_parameter('left_topic', '/camera/fisheye1/image_raw/rectified')
         self.declare_parameter('right_topic', '/camera/fisheye2/image_raw/rectified')
         self.declare_parameter('pointcloud_topic', '/stereo/points')
+        self.declare_parameter('depth_topic', '/stereo/depth')
         self.declare_parameter('backend', 'pytorch')
-        self.declare_parameter('model_dir', 'model_best_bp2_serialize.pth')
-        self.declare_parameter('trt_engine_dir', '/home/kqu/capstone/foundation_stereo_ros/onnx_23-36-37_iter8')
-        self.declare_parameter('trt_cfg_file', '')
+        self.declare_parameter('model_name', '23-36-37')
+        self.declare_parameter('models_root', '/home/kqu/capstone/foundation_stereo_ros/models')
         self.declare_parameter('trt_input_height', 0)
         self.declare_parameter('trt_input_width', 0)
         self.declare_parameter('intrinsic_file', '/home/kqu/capstone/foundation_stereo_ros/K.txt')
@@ -60,10 +61,10 @@ class FoundationStereoNode(Node):
         left_topic = self.get_parameter('left_topic').value
         right_topic = self.get_parameter('right_topic').value
         pointcloud_topic = self.get_parameter('pointcloud_topic').value
+        depth_topic = self.get_parameter('depth_topic').value
         self.backend = str(self.get_parameter('backend').value).strip().lower()
-        self.model_dir = os.path.expanduser(self.get_parameter('model_dir').value)
-        self.trt_engine_dir = os.path.expanduser(self.get_parameter('trt_engine_dir').value)
-        self.trt_cfg_file = os.path.expanduser(self.get_parameter('trt_cfg_file').value)
+        self.model_name = str(self.get_parameter('model_name').value).strip()
+        self.models_root = os.path.expanduser(self.get_parameter('models_root').value)
         self.trt_input_height = int(self.get_parameter('trt_input_height').value)
         self.trt_input_width = int(self.get_parameter('trt_input_width').value)
         self.intrinsic_file = os.path.expanduser(self.get_parameter('intrinsic_file').value)
@@ -71,7 +72,8 @@ class FoundationStereoNode(Node):
         self.scale = float(self.get_parameter('scale').value)
         self.input_height = int(self.get_parameter('input_height').value)
         self.input_width = int(self.get_parameter('input_width').value)
-        self.valid_iters = int(self.get_parameter('valid_iters').value)
+        self.requested_valid_iters = int(self.get_parameter('valid_iters').value)
+        self.valid_iters = self.requested_valid_iters
         self.max_disp = int(self.get_parameter('max_disp').value)
         self.hiera = int(self.get_parameter('hiera').value)
         self.remove_invisible = int(self.get_parameter('remove_invisible').value)
@@ -95,6 +97,7 @@ class FoundationStereoNode(Node):
 
         self._configure_logging()
         self.set_seed(0)
+        self._resolve_model_paths()
 
         if self.backend == 'pytorch':
             self.model_args = self._load_model_args_from_cfg()
@@ -109,6 +112,7 @@ class FoundationStereoNode(Node):
 
         self.bridge = CvBridge()
         self.pointcloud_pub = self.create_publisher(PointCloud2, pointcloud_topic, 10)
+        self.depth_pub = self.create_publisher(Image, depth_topic, 10)
 
         self.left_sub = Subscriber(self, Image, left_topic)
         self.right_sub = Subscriber(self, Image, right_topic)
@@ -121,12 +125,15 @@ class FoundationStereoNode(Node):
         self.sync.registerCallback(self.stereo_callback)
 
         self.get_logger().info(
-            f'Started foundation_stereo_node | backend: {self.backend}, left: {left_topic}, right: {right_topic}, pointcloud: {pointcloud_topic}'
+            f'Started foundation_stereo_node | backend: {self.backend}, left: {left_topic}, right: {right_topic}, '
+            f'pointcloud: {pointcloud_topic}, depth: {depth_topic}, model_name: {self.model_name}, valid_iters: {self.valid_iters}'
         )
         if self.backend == 'tensorrt':
             self.get_logger().info(
-                f'TensorRT input trim size (HxW): {self.trt_input_size[0]}x{self.trt_input_size[1]}'
+                f'TensorRT model dir: {self.trt_engine_dir}, input trim size (HxW): {self.trt_input_size[0]}x{self.trt_input_size[1]}'
             )
+        else:
+            self.get_logger().info(f'PyTorch model path: {self.model_dir}')
         self.get_logger().info(
             f'Projection setup | input: {self.input_height}x{self.input_width}, model input: {self.model_input_size[0]}x{self.model_input_size[1]}, '
             f'scale: ({self.scale_x:.4f}, {self.scale_y:.4f}), crop: ({self.crop_x}, {self.crop_y})'
@@ -137,6 +144,47 @@ class FoundationStereoNode(Node):
             level=logging.INFO,
             format='[%(asctime)s] [%(levelname)s] %(message)s',
         )
+
+    def _resolve_model_paths(self) -> None:
+        if not self.model_name:
+            raise RuntimeError('model_name must be non-empty')
+
+        if self.backend == 'pytorch':
+            model_dir = os.path.join(self.models_root, 'torch', self.model_name)
+            model_path = os.path.join(model_dir, 'model_best_bp2_serialize.pth')
+            if not os.path.isfile(model_path):
+                raise RuntimeError(
+                    f'PyTorch model not found for model_name={self.model_name}. Expected: {model_path}'
+                )
+            self.model_dir = model_path
+            return
+
+        trt_dir = os.path.join(
+            self.models_root,
+            'trt',
+            f'{self.model_name}_iter{self.requested_valid_iters}',
+        )
+        if not os.path.isdir(trt_dir):
+            trt_glob = os.path.join(self.models_root, 'trt', f'{self.model_name}_iter*')
+            available_trt_dirs = sorted([path for path in glob.glob(trt_glob) if os.path.isdir(path)])
+            available_text = ', '.join(available_trt_dirs) if available_trt_dirs else 'none'
+            raise RuntimeError(
+                f'TensorRT model folder not found for model_name={self.model_name}, '
+                f'valid_iters={self.requested_valid_iters}. Expected: {trt_dir}. '
+                f'Available variants: {available_text}'
+            )
+
+        feature_engine = os.path.join(trt_dir, 'feature_runner.engine')
+        post_engine = os.path.join(trt_dir, 'post_runner.engine')
+        cfg_file = os.path.join(trt_dir, 'onnx.yaml')
+        if not (os.path.isfile(feature_engine) and os.path.isfile(post_engine) and os.path.isfile(cfg_file)):
+            raise RuntimeError(
+                f'TensorRT folder is incomplete: {trt_dir}. Required files: '
+                'feature_runner.engine, post_runner.engine, onnx.yaml.'
+            )
+
+        self.trt_engine_dir = trt_dir
+        self.trt_cfg_file = cfg_file
 
     def _load_model_args_from_cfg(self):
         cfg_file = os.path.join(os.path.dirname(self.model_dir), 'cfg.yaml')
@@ -175,13 +223,28 @@ class FoundationStereoNode(Node):
 
     def _load_trt_args_from_cfg(self):
         cfg_file = self.trt_cfg_file
-        if not cfg_file:
-            cfg_file = os.path.join(os.path.dirname(self.trt_engine_dir), 'onnx.yaml')
         if not os.path.isfile(cfg_file):
             raise RuntimeError(f'onnx config not found: {cfg_file}')
 
         with open(cfg_file, 'r', encoding='utf-8') as f:
             cfg_dict = yaml.safe_load(f)
+
+        if 'valid_iters' not in cfg_dict:
+            raise RuntimeError(f"onnx config missing required key 'valid_iters': {cfg_file}")
+
+        trt_valid_iters = int(cfg_dict['valid_iters'])
+        if trt_valid_iters <= 0:
+            raise RuntimeError(
+                f"onnx config has invalid 'valid_iters'={trt_valid_iters}; expected positive integer: {cfg_file}"
+            )
+
+        if trt_valid_iters != self.requested_valid_iters:
+            raise RuntimeError(
+                f"TensorRT model config mismatch for {self.trt_engine_dir}: requested valid_iters="
+                f"{self.requested_valid_iters}, but onnx.yaml has valid_iters={trt_valid_iters}."
+            )
+
+        self.valid_iters = trt_valid_iters
 
         cfg_dict['onnx_dir'] = self.trt_engine_dir
         return OmegaConf.create(cfg_dict)
@@ -460,6 +523,10 @@ class FoundationStereoNode(Node):
                 disp = self._infer_disparity_tensorrt(left, right)
 
             depth = self._disparity_to_depth(disp)
+            depth_msg = self.bridge.cv2_to_imgmsg(depth, encoding='32FC1')
+            depth_msg.header = left_msg.header
+            self.depth_pub.publish(depth_msg)
+
             pointcloud_msg = self._depth_to_pointcloud_msg(depth, left_msg.header)
             self.pointcloud_pub.publish(pointcloud_msg)
 

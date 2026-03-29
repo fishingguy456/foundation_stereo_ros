@@ -3,11 +3,11 @@ foundation_stereo_node:
     left_topic: /camera/fisheye1/image_raw/rectified
     right_topic: /camera/fisheye2/image_raw/rectified
     pointcloud_topic: /stereo/points
+    depth_topic: /stereo/depth
 
     backend: tensorrt
-    model_dir: /home/kqu/capstone/foundation_stereo_ros/models/torch/23-36-37/model_best_bp2_serialize.pth
-    trt_engine_dir: /home/kqu/capstone/foundation_stereo_ros/models/trt/onnx_23-36-37_iter8/
-    trt_cfg_file: ''
+    model_name: 23-36-37
+    models_root: /home/kqu/capstone/foundation_stereo_ros/models
     trt_input_height: 0
     trt_input_width: 0
 
@@ -17,7 +17,7 @@ foundation_stereo_node:
     input_height: 400
     input_width: 488
 
-    valid_iters: 8
+    valid_iters: 4  # pytorch uses this for inference; tensorrt uses it to select <model_name>_iter<valid_iters>
     max_disp: 192
     hiera: 0
     remove_invisible: 1

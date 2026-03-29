@@ -36,6 +36,7 @@ ros2 launch foundation_stereo_ros stereo_depth.launch.py
 ```
 
 Notes:
-- `backend:=pytorch` uses `model_dir` and supports `scale`, `valid_iters`, `max_disp`, `hiera`.
-- `backend:=tensorrt` uses `trt_engine_dir` with `feature_runner.engine` and `post_runner.engine`.
+- Set one `model_name` (for example `23-36-37`) and one `models_root` (default `foundation_stereo_ros/models`).
+- `backend:=pytorch` resolves model path to `models_root/torch/<model_name>/model_best_bp2_serialize.pth` and uses `valid_iters`, `scale`, `max_disp`, `hiera`.
+- `backend:=tensorrt` resolves engine dir from `models_root/trt/onnx_<model_name>_iter*`, picks the highest available iter variant, and reads `valid_iters` from that variant's `onnx.yaml`.
 - Input image size defaults to 400x488 (`input_height`, `input_width`) and intrinsics are adjusted once at node startup.
