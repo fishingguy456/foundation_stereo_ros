@@ -70,6 +70,7 @@ class FoundationStereoNode(Node):
         self.declare_parameter('zfar', 5.0)
         self.declare_parameter('sync_slop', 0.03)
         self.declare_parameter('queue_size', 8)
+        self.declare_parameter('log_every_n_frames', 30)
 
         left_topic = self.get_parameter('left_topic').value
         right_topic = self.get_parameter('right_topic').value
@@ -77,6 +78,7 @@ class FoundationStereoNode(Node):
         depth_topic = self.get_parameter('depth_topic').value
         self.backend = str(self.get_parameter('backend').value).strip().lower()
         self.input_source = str(self.get_parameter('input_source').value).strip().lower()
+        assert self.input_source == "ros"
         self.zmq_host = self._resolve_zmq_host(str(self.get_parameter('zmq_host').value).strip())
         self.zmq_port = int(self.get_parameter('zmq_port').value)
         self.zmq_rcv_hwm = int(self.get_parameter('zmq_rcv_hwm').value)
@@ -104,6 +106,7 @@ class FoundationStereoNode(Node):
         self.zfar = float(self.get_parameter('zfar').value)
         sync_slop = float(self.get_parameter('sync_slop').value)
         queue_size = int(self.get_parameter('queue_size').value)
+        self.log_every_n_frames = max(1, int(self.get_parameter('log_every_n_frames').value))
 
         from Utils import set_seed
         self.set_seed = set_seed
@@ -775,12 +778,13 @@ class FoundationStereoNode(Node):
 
         cb_total_ms = (time.perf_counter() - cb_t0) * 1000.0
         self._frame_count += 1
-        self.get_logger().info(
-            f'Timing frame={self._frame_count} source={source} | src_decode={t_source_decode_ms:.2f} ms, '
-            f'infer={t_infer_ms:.2f} ms, disp_to_depth={t_disp_to_depth_ms:.2f} ms, depth_pub={t_depth_pub_ms:.2f} ms, '
-            f'pc_points={t_points_ms:.2f} ms, pc_denoise={t_denoise_ms:.2f} ms, pc_pub={t_pc_pub_ms:.2f} ms, '
-            f'pc_count={num_points}, total={cb_total_ms:.2f} ms'
-        )
+        if self._frame_count % self.log_every_n_frames == 0:
+            self.get_logger().info(
+                f'Timing frame={self._frame_count} source={source} | src_decode={t_source_decode_ms:.2f} ms, '
+                f'infer={t_infer_ms:.2f} ms, disp_to_depth={t_disp_to_depth_ms:.2f} ms, depth_pub={t_depth_pub_ms:.2f} ms, '
+                f'pc_points={t_points_ms:.2f} ms, pc_denoise={t_denoise_ms:.2f} ms, pc_pub={t_pc_pub_ms:.2f} ms, '
+                f'pc_count={num_points}, total={cb_total_ms:.2f} ms'
+            )
 
     def destroy_node(self):
         if self._zmq_sock is not None:

@@ -1,12 +1,12 @@
 foundation_stereo_node:
   ros__parameters:
-    left_topic: /camera/fisheye1/image_raw/rectified
-    right_topic: /camera/fisheye2/image_raw/rectified
+    left_topic: /camera/left/image_rect
+    right_topic: /camera/right/image_rect
     pointcloud_topic: /stereo/points
     depth_topic: /stereo/depth
 
     backend: tensorrt
-    input_source: zmq
+    input_source: ros
     zmq_host: ${ZT_DRONE_IP}
     zmq_port: 5555
     zmq_rcv_hwm: 2
@@ -35,3 +35,4 @@ foundation_stereo_node:
     zfar: 3.0
     sync_slop: 0.03
     queue_size: 8
+    log_every_n_frames: 10
