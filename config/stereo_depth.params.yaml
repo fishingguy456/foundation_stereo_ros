@@ -32,7 +32,7 @@ foundation_stereo_node:
     denoise_nb_points: 10
     denoise_radius: 0.03
     denoise_voxel_size: 0.01
-    zfar: 3.0
+    zfar: 5.0
     sync_slop: 0.03
     queue_size: 8
     log_every_n_frames: 10
