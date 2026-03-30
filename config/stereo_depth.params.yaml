@@ -6,6 +6,12 @@ foundation_stereo_node:
     depth_topic: /stereo/depth
 
     backend: tensorrt
+    input_source: zmq
+    zmq_host: ${ZT_DRONE_IP}
+    zmq_port: 5555
+    zmq_rcv_hwm: 2
+    zmq_poll_period_sec: 0.001
+    output_frame_id: camera_left
     model_name: 23-36-37
     models_root: /home/kqu/capstone/foundation_stereo_ros/models
     trt_input_height: 0
@@ -26,6 +32,6 @@ foundation_stereo_node:
     denoise_nb_points: 10
     denoise_radius: 0.03
     denoise_voxel_size: 0.01
-    zfar: 5.0
+    zfar: 3.0
     sync_slop: 0.03
     queue_size: 8
