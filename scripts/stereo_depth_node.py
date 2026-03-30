@@ -6,7 +6,7 @@ import yaml
 import logging
 import glob
 import time
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -16,6 +16,7 @@ from cv_bridge import CvBridge
 from message_filters import ApproximateTimeSynchronizer, Subscriber
 from omegaconf import OmegaConf
 from rclpy.node import Node
+from rclpy.time import Time
 from sensor_msgs.msg import Image, PointCloud2, PointField
 
 
@@ -42,6 +43,12 @@ class FoundationStereoNode(Node):
         self.declare_parameter('pointcloud_topic', '/stereo/points')
         self.declare_parameter('depth_topic', '/stereo/depth')
         self.declare_parameter('backend', 'pytorch')
+        self.declare_parameter('input_source', 'ros')
+        self.declare_parameter('zmq_host', 'localhost')
+        self.declare_parameter('zmq_port', 5555)
+        self.declare_parameter('zmq_rcv_hwm', 2)
+        self.declare_parameter('zmq_poll_period_sec', 0.001)
+        self.declare_parameter('output_frame_id', 'camera_left')
         self.declare_parameter('model_name', '23-36-37')
         self.declare_parameter('models_root', '/home/kqu/capstone/foundation_stereo_ros/models')
         self.declare_parameter('trt_input_height', 0)
@@ -69,6 +76,12 @@ class FoundationStereoNode(Node):
         pointcloud_topic = self.get_parameter('pointcloud_topic').value
         depth_topic = self.get_parameter('depth_topic').value
         self.backend = str(self.get_parameter('backend').value).strip().lower()
+        self.input_source = str(self.get_parameter('input_source').value).strip().lower()
+        self.zmq_host = self._resolve_zmq_host(str(self.get_parameter('zmq_host').value).strip())
+        self.zmq_port = int(self.get_parameter('zmq_port').value)
+        self.zmq_rcv_hwm = int(self.get_parameter('zmq_rcv_hwm').value)
+        self.zmq_poll_period_sec = float(self.get_parameter('zmq_poll_period_sec').value)
+        self.output_frame_id = str(self.get_parameter('output_frame_id').value).strip()
         self.model_name = str(self.get_parameter('model_name').value).strip()
         self.models_root = os.path.expanduser(self.get_parameter('models_root').value)
         self.trt_input_height = int(self.get_parameter('trt_input_height').value)
@@ -138,20 +151,56 @@ class FoundationStereoNode(Node):
         self.pointcloud_pub = self.create_publisher(PointCloud2, pointcloud_topic, 10)
         self.depth_pub = self.create_publisher(Image, depth_topic, 10)
 
-        self.left_sub = Subscriber(self, Image, left_topic)
-        self.right_sub = Subscriber(self, Image, right_topic)
-        self.sync = ApproximateTimeSynchronizer(
-            [self.left_sub, self.right_sub],
-            queue_size=queue_size,
-            slop=sync_slop,
-            allow_headerless=False,
-        )
-        self.sync.registerCallback(self.stereo_callback)
+        self._zmq_ctx = None
+        self._zmq_sock = None
+        self._zmq_timer = None
+        self._zmq_mod: Optional[Any] = None
+        self._msgpack_mod: Optional[Any] = None
+
+        if self.input_source == 'ros':
+            self.left_sub = Subscriber(self, Image, left_topic)
+            self.right_sub = Subscriber(self, Image, right_topic)
+            self.sync = ApproximateTimeSynchronizer(
+                [self.left_sub, self.right_sub],
+                queue_size=queue_size,
+                slop=sync_slop,
+                allow_headerless=False,
+            )
+            self.sync.registerCallback(self.stereo_callback)
+        elif self.input_source == 'zmq':
+            if self.zmq_poll_period_sec <= 0.0:
+                raise RuntimeError('zmq_poll_period_sec must be > 0')
+
+            try:
+                import zmq as zmq_mod  # type: ignore
+                import msgpack as msgpack_mod  # type: ignore
+            except Exception as exc:
+                raise RuntimeError(
+                    'input_source:=zmq requires python packages pyzmq and msgpack. '
+                    'Install them in the active environment.'
+                ) from exc
+
+            self._zmq_mod = zmq_mod
+            self._msgpack_mod = msgpack_mod
+
+            self._zmq_ctx = self._zmq_mod.Context()
+            self._zmq_sock = self._zmq_ctx.socket(self._zmq_mod.PULL)
+            self._zmq_sock.setsockopt(self._zmq_mod.RCVHWM, self.zmq_rcv_hwm)
+            self._zmq_sock.setsockopt(self._zmq_mod.LINGER, 0)
+            self._zmq_sock.connect(f'tcp://{self.zmq_host}:{self.zmq_port}')
+            self._zmq_timer = self.create_timer(self.zmq_poll_period_sec, self.zmq_callback)
+        else:
+            raise RuntimeError(f"Unsupported input_source '{self.input_source}'. Use 'ros' or 'zmq'.")
 
         self.get_logger().info(
-            f'Started foundation_stereo_node | backend: {self.backend}, left: {left_topic}, right: {right_topic}, '
+            f'Started foundation_stereo_node | backend: {self.backend}, source: {self.input_source}, left: {left_topic}, right: {right_topic}, '
             f'pointcloud: {pointcloud_topic}, depth: {depth_topic}, model_name: {self.model_name}, valid_iters: {self.valid_iters}'
         )
+        if self.input_source == 'zmq':
+            self.get_logger().info(
+                f'ZMQ input connected to tcp://{self.zmq_host}:{self.zmq_port} '
+                f'| rcv_hwm: {self.zmq_rcv_hwm}, poll_period: {self.zmq_poll_period_sec}s'
+            )
         if self.backend == 'tensorrt':
             self.get_logger().info(
                 f'TensorRT model dir: {self.trt_engine_dir}, input trim size (HxW): {self.trt_input_size[0]}x{self.trt_input_size[1]}'
@@ -174,6 +223,20 @@ class FoundationStereoNode(Node):
             level=logging.INFO,
             format='[%(asctime)s] [%(levelname)s] %(message)s',
         )
+
+    def _resolve_zmq_host(self, host_value: str) -> str:
+        expanded_host = os.path.expandvars(host_value).strip()
+        if not expanded_host:
+            raise RuntimeError('zmq_host resolved to an empty value')
+
+        unresolved_patterns = ('$' in expanded_host) or ('${' in expanded_host)
+        if unresolved_patterns:
+            raise RuntimeError(
+                f"zmq_host contains unresolved environment variable syntax: '{host_value}'. "
+                'Set the variable before launch or provide a concrete host/IP.'
+            )
+
+        return expanded_host
 
     def _resolve_model_paths(self) -> None:
         if not self.model_name:
@@ -573,14 +636,9 @@ class FoundationStereoNode(Node):
 
     def stereo_callback(self, left_msg: Image, right_msg: Image) -> None:
         try:
-            cb_t0 = time.perf_counter()
-
             t0 = time.perf_counter()
             left = self._to_rgb_np(left_msg)
             right = self._to_rgb_np(right_msg)
-            t_to_rgb_ms = (time.perf_counter() - t0) * 1000.0
-
-            t0 = time.perf_counter()
             if left.shape[:2] != (self.input_height, self.input_width):
                 raise RuntimeError(
                     f'Unexpected left image size {left.shape[0]}x{left.shape[1]}; expected {self.input_height}x{self.input_width}'
@@ -589,57 +647,149 @@ class FoundationStereoNode(Node):
                 raise RuntimeError(
                     f'Unexpected right image size {right.shape[0]}x{right.shape[1]}; expected {self.input_height}x{self.input_width}'
                 )
-            t_validate_ms = (time.perf_counter() - t0) * 1000.0
+            t_to_rgb_ms = (time.perf_counter() - t0) * 1000.0
 
-            t0 = time.perf_counter()
-            if self.backend == 'pytorch':
-                disp = self._infer_disparity_pytorch(left, right)
-            else:
-                disp = self._infer_disparity_tensorrt(left, right)
-            t_infer_ms = (time.perf_counter() - t0) * 1000.0
-
-            t0 = time.perf_counter()
-            depth = self._disparity_to_depth(disp)
-            t_disp_to_depth_ms = (time.perf_counter() - t0) * 1000.0
-
-            t0 = time.perf_counter()
-            depth_msg = self.bridge.cv2_to_imgmsg(depth, encoding='32FC1')
-            depth_msg.header = left_msg.header
-            self.depth_pub.publish(depth_msg)
-            t_depth_pub_ms = (time.perf_counter() - t0) * 1000.0
-
-            t_points_ms = 0.0
-            t_denoise_ms = 0.0
-            t_pc_pub_ms = 0.0
-            num_points = 0
-
-            if self.get_pc:
-                t0 = time.perf_counter()
-                points = self._depth_to_points(depth)
-                t_points_ms = (time.perf_counter() - t0) * 1000.0
-
-                if self.denoise_cloud or self.denoise_voxel_size > 0.0:
-                    t0 = time.perf_counter()
-                    points = self._denoise_points(points)
-                    t_denoise_ms = (time.perf_counter() - t0) * 1000.0
-
-                num_points = int(points.shape[0])
-                t0 = time.perf_counter()
-                pointcloud_msg = self._points_to_pointcloud_msg(points, left_msg.header)
-                self.pointcloud_pub.publish(pointcloud_msg)
-                t_pc_pub_ms = (time.perf_counter() - t0) * 1000.0
-
-            cb_total_ms = (time.perf_counter() - cb_t0) * 1000.0
-            self._frame_count += 1
-            self.get_logger().info(
-                f'Timing frame={self._frame_count} | rgb={t_to_rgb_ms:.2f} ms, validate={t_validate_ms:.2f} ms, '
-                f'infer={t_infer_ms:.2f} ms, disp_to_depth={t_disp_to_depth_ms:.2f} ms, depth_pub={t_depth_pub_ms:.2f} ms, '
-                f'pc_points={t_points_ms:.2f} ms, pc_denoise={t_denoise_ms:.2f} ms, pc_pub={t_pc_pub_ms:.2f} ms, '
-                f'pc_count={num_points}, total={cb_total_ms:.2f} ms'
+            self._process_stereo_pair(
+                left=left,
+                right=right,
+                header=left_msg.header,
+                source='ros',
+                t_source_decode_ms=t_to_rgb_ms,
             )
 
         except Exception as exc:
             self.get_logger().error(f'stereo callback failed: {exc}')
+
+    def _decode_jpeg_to_rgb(self, data: bytes) -> np.ndarray:
+        arr = np.frombuffer(data, dtype=np.uint8)
+        bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if bgr is None:
+            raise RuntimeError('JPEG decode failed')
+        return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+    def _recv_latest_zmq_frame(self):
+        if self._zmq_sock is None:
+            return None
+        if self._zmq_mod is None:
+            return None
+
+        latest_raw = None
+        while True:
+            try:
+                latest_raw = self._zmq_sock.recv(flags=self._zmq_mod.NOBLOCK)
+            except self._zmq_mod.Again:
+                break
+
+        return latest_raw
+
+    def zmq_callback(self) -> None:
+        try:
+            cb_t0 = time.perf_counter()
+            raw = self._recv_latest_zmq_frame()
+            t_recv_ms = (time.perf_counter() - cb_t0) * 1000.0
+            if raw is None:
+                return
+            if self._msgpack_mod is None:
+                return
+
+            t0 = time.perf_counter()
+            frame = self._msgpack_mod.unpackb(raw, raw=False)
+            t_unpack_ms = (time.perf_counter() - t0) * 1000.0
+
+            t0 = time.perf_counter()
+            left = self._decode_jpeg_to_rgb(frame['left'])
+            right = self._decode_jpeg_to_rgb(frame['right'])
+            t_decode_ms = (time.perf_counter() - t0) * 1000.0
+
+            if left.shape[:2] != (self.input_height, self.input_width):
+                raise RuntimeError(
+                    f'Unexpected left image size {left.shape[0]}x{left.shape[1]}; expected {self.input_height}x{self.input_width}'
+                )
+            if right.shape[:2] != (self.input_height, self.input_width):
+                raise RuntimeError(
+                    f'Unexpected right image size {right.shape[0]}x{right.shape[1]}; expected {self.input_height}x{self.input_width}'
+                )
+
+            if 'ts' in frame and isinstance(frame['ts'], (list, tuple)) and len(frame['ts']) == 2:
+                sec = int(frame['ts'][0])
+                nanosec = int(frame['ts'][1])
+                stamp = Time(seconds=sec, nanoseconds=nanosec).to_msg()
+            else:
+                stamp = self.get_clock().now().to_msg()
+
+            header = Image().header
+            header.stamp = stamp
+            header.frame_id = self.output_frame_id
+
+            self._process_stereo_pair(
+                left=left,
+                right=right,
+                header=header,
+                source='zmq',
+                t_source_decode_ms=t_recv_ms + t_unpack_ms + t_decode_ms,
+            )
+
+        except Exception as exc:
+            self.get_logger().error(f'zmq callback failed: {exc}')
+
+    def _process_stereo_pair(self, left: np.ndarray, right: np.ndarray, header, source: str, t_source_decode_ms: float) -> None:
+        cb_t0 = time.perf_counter()
+
+        t0 = time.perf_counter()
+        if self.backend == 'pytorch':
+            disp = self._infer_disparity_pytorch(left, right)
+        else:
+            disp = self._infer_disparity_tensorrt(left, right)
+        t_infer_ms = (time.perf_counter() - t0) * 1000.0
+
+        t0 = time.perf_counter()
+        depth = self._disparity_to_depth(disp)
+        t_disp_to_depth_ms = (time.perf_counter() - t0) * 1000.0
+
+        t0 = time.perf_counter()
+        depth_msg = self.bridge.cv2_to_imgmsg(depth, encoding='32FC1')
+        depth_msg.header = header
+        self.depth_pub.publish(depth_msg)
+        t_depth_pub_ms = (time.perf_counter() - t0) * 1000.0
+
+        t_points_ms = 0.0
+        t_denoise_ms = 0.0
+        t_pc_pub_ms = 0.0
+        num_points = 0
+
+        if self.get_pc:
+            t0 = time.perf_counter()
+            points = self._depth_to_points(depth)
+            t_points_ms = (time.perf_counter() - t0) * 1000.0
+
+            if self.denoise_cloud or self.denoise_voxel_size > 0.0:
+                t0 = time.perf_counter()
+                points = self._denoise_points(points)
+                t_denoise_ms = (time.perf_counter() - t0) * 1000.0
+
+            num_points = int(points.shape[0])
+            t0 = time.perf_counter()
+            pointcloud_msg = self._points_to_pointcloud_msg(points, header)
+            self.pointcloud_pub.publish(pointcloud_msg)
+            t_pc_pub_ms = (time.perf_counter() - t0) * 1000.0
+
+        cb_total_ms = (time.perf_counter() - cb_t0) * 1000.0
+        self._frame_count += 1
+        self.get_logger().info(
+            f'Timing frame={self._frame_count} source={source} | src_decode={t_source_decode_ms:.2f} ms, '
+            f'infer={t_infer_ms:.2f} ms, disp_to_depth={t_disp_to_depth_ms:.2f} ms, depth_pub={t_depth_pub_ms:.2f} ms, '
+            f'pc_points={t_points_ms:.2f} ms, pc_denoise={t_denoise_ms:.2f} ms, pc_pub={t_pc_pub_ms:.2f} ms, '
+            f'pc_count={num_points}, total={cb_total_ms:.2f} ms'
+        )
+
+    def destroy_node(self):
+        if self._zmq_sock is not None:
+            self._zmq_sock.close()
+            self._zmq_sock = None
+        if self._zmq_ctx is not None:
+            self._zmq_ctx.term()
+            self._zmq_ctx = None
+        return super().destroy_node()
 
 
 def main(args=None):
